@@ -7,7 +7,7 @@ An AI-powered, multi-step code review tool. Paste any code snippet and receive a
 | Layer | Tech | Port |
 |-------|------|------|
 | Frontend | React 18 + Vite, `react-simple-code-editor`, PrismJS | 5173 |
-| Agent backend | Node.js + Express, Groq SDK (`llama-3.3-70b-versatile`) | 8000 |
+| Agent backend | Node.js + Express, Groq SDK, LangGraph | 8000 |
 
 ## How it works
 
