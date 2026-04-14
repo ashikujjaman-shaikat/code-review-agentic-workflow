@@ -24,7 +24,10 @@ async function chatCompletion(messages, { model, maxTokens = 800, temperature = 
     max_tokens: maxTokens,
     temperature,
   });
-  return completion.choices[0]?.message?.content ?? '';
+  return {
+    text: completion.choices[0]?.message?.content ?? '',
+    usage: completion.usage ?? null,
+  };
 }
 
 /**

@@ -34,10 +34,8 @@ async function handleReview(req, res) {
   }
 }
 
-// Direct route (used internally / by tests)
-// app.post('/review', handleReview);
 
-// Frontend-facing route (matches the old backend proxy path)
+// Frontend-facing route to handle code review requests
 app.post('/api/review', handleReview);
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
