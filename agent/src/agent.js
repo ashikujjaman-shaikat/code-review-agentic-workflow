@@ -1,6 +1,6 @@
 'use strict';
 
-const { chatCompletion, safeParseJson } = require('./llm');
+const { chatCompletion, safeParseJson, schemas } = require('./llm');
 
 // ─── System prompt ─────────────────────────────────────────────────────────────
 
@@ -22,14 +22,37 @@ class LangGraph {
     this.nodes = [];
   }
 
-  addNode(fn) {
-    this.nodes.push(fn);
+  /**
+   * Add a node with optional conditional execution.
+   * Increases agenticity by allowing the agent to decide execution paths.
+   * 
+   * @param {Function} fn - Node function to execute
+   * @param {Function} [condition] - Optional condition (state) => boolean
+   */
+  addNode(fn, condition = null) {
+    this.nodes.push({ fn, condition });
     return this; // fluent
   }
 
+  /**
+   * Run the graph with conditional branching support.
+   * Nodes can be skipped based on runtime state evaluation.
+   */
   async run() {
-    for (const node of this.nodes) {
-      await node(this.state);
+    for (const { fn, condition } of this.nodes) {
+      // Conditional execution: agent decides whether to run this node
+      if (condition && !condition(this.state)) {
+        console.log(`[LangGraph] Skipping node ${fn.name} (condition not met)`);
+        continue;
+      }
+      
+      await fn(this.state);
+      
+      // Check if state indicates early termination
+      if (this.state.shouldTerminate) {
+        console.log(`[LangGraph] Early termination requested by ${fn.name}`);
+        break;
+      }
     }
   }
 }
@@ -148,8 +171,8 @@ async function reviewNode(state) {
   ];
 
   const t0 = Date.now();
-  const { text: res, usage } = await chatCompletion(messages, { maxTokens: 600 });
-  console.log(`[reviewNode]     latency: ${Date.now() - t0}ms | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
+  const { text: res, usage, retries } = await chatCompletion(messages, { maxTokens: 600 });
+  console.log(`[reviewNode]     latency: ${Date.now() - t0}ms | retries: ${retries} | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
   state.review = res.trim();
   if (!isText) {
     state.language = detectLanguage(state.code);
@@ -157,7 +180,7 @@ async function reviewNode(state) {
 }
 
 /**
- * Node 2 — structured issue extraction
+ * Node 2 — structured issue extraction with schema validation
  */
 async function issuesNode(state) {
   const prompt =
@@ -172,19 +195,28 @@ async function issuesNode(state) {
   ];
 
   const t0 = Date.now();
-  const { text: res, usage } = await chatCompletion(messages, { maxTokens: 900 });
-  console.log(`[issuesNode]     latency: ${Date.now() - t0}ms | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
-  const parsed = safeParseJson(res);
+  const { text: res, usage, retries } = await chatCompletion(messages, { maxTokens: 900 });
+  console.log(`[issuesNode]     latency: ${Date.now() - t0}ms | retries: ${retries} | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
+  
+  // Use schema validation for increased reliability
+  const parsed = safeParseJson(res, schemas.issues);
 
   if (parsed && Array.isArray(parsed.issues)) {
     state.issues = parsed.issues;
+    // Agent decision: count critical issues for conditional branching
+    state.criticalIssueCount = parsed.issues.filter(i => 
+      (i.severity || '').toLowerCase() === 'high' || 
+      (i.severity || '').toLowerCase() === 'critical'
+    ).length;
   } else {
+    console.warn('[issuesNode] Failed schema validation, using fallback');
     state.issues = [{ title: 'Unstructured issues', severity: 'medium', explanation: res || 'No issues returned' }];
+    state.criticalIssueCount = 0;
   }
 }
 
 /**
- * Node 3 — actionable suggestions + optional patch
+ * Node 3 — actionable suggestions + optional patch with schema validation
  */
 async function suggestionNode(state) {
   const prompt =
@@ -199,21 +231,23 @@ async function suggestionNode(state) {
   ];
 
   const t0 = Date.now();
-  const { text: res, usage } = await chatCompletion(messages, { maxTokens: 1200 });
-  console.log(`[suggestionNode] latency: ${Date.now() - t0}ms | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
-  const parsed = safeParseJson(res);
+  const { text: res, usage, retries } = await chatCompletion(messages, { maxTokens: 1200 });
+  console.log(`[suggestionNode] latency: ${Date.now() - t0}ms | retries: ${retries} | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
+  
+  const parsed = safeParseJson(res, schemas.suggestion);
 
   if (parsed && typeof parsed === 'object') {
     let suggestion = (parsed.suggestion || parsed.fixes || '').trim() || res.slice(0, 2000);
     const patch = parsed.patch || parsed.code || parsed.fixed_code || '';
     state.suggestion = patch ? `${suggestion}\n\n${patch}`.trim() : suggestion;
   } else {
+    console.warn('[suggestionNode] Failed schema validation, using raw output');
     state.suggestion = res.trim();
   }
 }
 
 /**
- * Node 4 — reflective final summary
+ * Node 4 — reflective final summary with schema validation
  */
 async function reflectNode(state) {
   const prompt =
@@ -227,21 +261,104 @@ async function reflectNode(state) {
   ];
 
   const t0 = Date.now();
-  const { text: res, usage } = await chatCompletion(messages, { maxTokens: 800 });
-  console.log(`[reflectNode]    latency: ${Date.now() - t0}ms | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
-  const parsed = safeParseJson(res);
+  const { text: res, usage, retries } = await chatCompletion(messages, { maxTokens: 800 });
+  console.log(`[reflectNode]    latency: ${Date.now() - t0}ms | retries: ${retries} | prompt: ${usage?.prompt_tokens ?? '?'} | completion: ${usage?.completion_tokens ?? '?'} | total: ${usage?.total_tokens ?? '?'} tokens`);
+  
+  const parsed = safeParseJson(res, schemas.final);
 
   if (parsed && typeof parsed.final === 'string') {
     state.final = parsed.final.trim();
   } else {
+    console.warn('[reflectNode] Failed schema validation, using raw output');
     state.final = res.trim();
   }
+}
+
+/**
+ * Node 5 — Self-verification node (AGENTIC IMPROVEMENT)
+ * The agent validates its own outputs and flags quality issues autonomously.
+ */
+async function verificationNode(state) {
+  console.log('[verificationNode] Running self-verification checks...');
+  
+  const checks = {
+    hasReview: !!state.review && state.review.length > 50,
+    hasIssues: Array.isArray(state.issues) && state.issues.length > 0,
+    hasSuggestion: !!state.suggestion && state.suggestion.length > 20,
+    hasFinal: !!state.final && state.final.length > 50,
+    issuesWellFormed: state.issues.every(i => i.title && i.severity && i.explanation),
+  };
+  
+  const passed = Object.values(checks).filter(Boolean).length;
+  const total = Object.keys(checks).length;
+  
+  state.verificationScore = passed / total;
+  state.verificationChecks = checks;
+  
+  console.log(`[verificationNode] Quality score: ${(state.verificationScore * 100).toFixed(0)}% (${passed}/${total} checks passed)`);
+  
+  // Agent decision: flag low-quality outputs
+  if (state.verificationScore < 0.6) {
+    console.warn('[verificationNode] WARNING: Output quality below threshold');
+    state.qualityWarning = 'Some review components may be incomplete or low-quality';
+  }
+}
+
+/**
+ * Node 6 — Tool executor framework (AGENTIC IMPROVEMENT SCAFFOLD)
+ * Enables the agent to execute external tools/actions autonomously.
+ * Currently a scaffold - ready for git, file, test, or API integrations.
+ */
+async function toolExecutorNode(state) {
+  // Check if any tools are requested based on detected issues
+  const toolActions = [];
+  
+  // Example: if critical security issues found, suggest running security scan
+  if (state.criticalIssueCount > 0) {
+    toolActions.push({
+      tool: 'security-scan',
+      reason: `${state.criticalIssueCount} critical issue(s) detected`,
+      command: 'npm audit', // Example
+      autoExecute: false, // Requires user confirmation
+    });
+  }
+  
+  // Example: if code formatting issues, suggest running formatter
+  const hasFormattingIssues = state.issues.some(i => 
+    i.title.toLowerCase().includes('format') || 
+    i.title.toLowerCase().includes('style')
+  );
+  
+  if (hasFormattingIssues) {
+    toolActions.push({
+      tool: 'code-formatter',
+      reason: 'Formatting/style issues detected',
+      command: 'npm run format', // Example
+      autoExecute: false,
+    });
+  }
+  
+  state.suggestedTools = toolActions;
+  
+  if (toolActions.length > 0) {
+    console.log(`[toolExecutorNode] Suggested ${toolActions.length} tool action(s):`, toolActions.map(t => t.tool).join(', '));
+  } else {
+    console.log('[toolExecutorNode] No automated tools suggested');
+  }
+  
+  // Future: Add actual tool execution logic here
+  // e.g., run git commands, file operations, test runners, etc.
 }
 
 // ─── Factory ────────────────────────────────────────────────────────────────────
 
 /**
  * Build and run the full code-review graph for the given code snippet.
+ * NOW WITH ENHANCED AGENTICITY:
+ * - Conditional branching based on runtime state
+ * - Self-verification of outputs
+ * - Tool execution suggestions
+ * - Retry/resilience in LLM calls
  *
  * @param {string} code
  * @returns {Promise<CodeReviewState>}
@@ -255,21 +372,41 @@ async function runCodeReview(code) {
     issues: [],
     suggestion: '',
     final: '',
+    criticalIssueCount: 0,
+    verificationScore: 0,
+    verificationChecks: {},
+    suggestedTools: [],
+    shouldTerminate: false,
   };
 
   const plainText = isPlainText(code);
   state.language = plainText ? 'plaintext' : null;
 
+  // Build graph with conditional execution (AGENTIC IMPROVEMENT)
   const graph = new LangGraph(state).addNode(reviewNode);
+  
   if (!plainText) {
     graph
       .addNode(issuesNode)
       .addNode(suggestionNode)
-      .addNode(reflectNode);
+      .addNode(reflectNode)
+      // AGENTIC IMPROVEMENTS: Add verification and tool executor
+      .addNode(verificationNode)
+      .addNode(toolExecutorNode, (s) => s.criticalIssueCount > 0 || s.issues.length > 3); // Conditional: only run if significant issues
   }
 
   await graph.run();
   return state;
 }
 
-module.exports = { LangGraph, runCodeReview, isPlainText, reviewNode, issuesNode, suggestionNode, reflectNode };
+module.exports = { 
+  LangGraph, 
+  runCodeReview, 
+  isPlainText, 
+  reviewNode, 
+  issuesNode, 
+  suggestionNode, 
+  reflectNode,
+  verificationNode,
+  toolExecutorNode,
+};
